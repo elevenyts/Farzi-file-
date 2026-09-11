@@ -36,9 +36,6 @@ SIGNATURE = "◄❥‌‌⃟⃝♛❤️‍🔥 ⃪ͥ͢ ᷟ•ᥫ᭡𝐀⃯⃖�
 MIN_OPTIONS = 2
 MAX_OPTIONS = 4
 
-# How long each poll stays open before the bot auto-sends the next question.
-QUESTION_SECONDS = int(os.environ.get("QUESTION_SECONDS", "15"))
-
 POLL_QUESTION_MAX = 300
 POLL_OPTION_MAX = 100
 POLL_EXPLANATION_MAX = 200
@@ -120,7 +117,6 @@ def build_poll_question(item):
     text = f"{item['question']}\n\n{SIGNATURE}"
     if len(text) <= POLL_QUESTION_MAX:
         return text
-    # Trim the question part only, keep the full signature intact.
     overflow = len(text) - POLL_QUESTION_MAX
     trimmed_question = item["question"][: max(0, len(item["question"]) - overflow - 1)] + "…"
     return f"{trimmed_question}\n\n{SIGNATURE}"
@@ -137,15 +133,20 @@ def build_poll_explanation(item):
     return explanation[:POLL_EXPLANATION_MAX]
 
 
-def job_name_for(chat_id):
-    return f"advance_{chat_id}"
-
-
-def cancel_advance_job(context: ContextTypes.DEFAULT_TYPE, chat_id):
-    if context.job_queue is None:
+async def try_stop_open_poll(chat_id, context: ContextTypes.DEFAULT_TYPE):
+    """Best-effort: close whatever poll is currently tracked, ignore if already closed."""
+    message_id = context.user_data.get("poll_message_id")
+    if not message_id:
         return
-    for job in context.job_queue.get_jobs_by_name(job_name_for(chat_id)):
-        job.schedule_removal()
+    try:
+        await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+def reset_quiz_state(context: ContextTypes.DEFAULT_TYPE):
+    for key in ("quiz_file", "quiz_items", "q_index", "score", "total", "poll_id", "poll_message_id", "correct_index"):
+        context.user_data.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +154,9 @@ def cancel_advance_job(context: ContextTypes.DEFAULT_TYPE, chat_id):
 # ---------------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cancel_advance_job(context, update.effective_chat.id)
-    context.user_data.clear()
+    chat_id = update.effective_chat.id
+    await try_stop_open_poll(chat_id, context)
+    reset_quiz_state(context)
 
     files = list_quiz_files()
     if not files:
@@ -195,7 +197,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "```\n"
         "- 2, 3 ya 4 options allowed\n"
         "- 'correct' 0-based index hota hai (pehla option = 0)\n\n"
-        f"⏱ Har question {QUESTION_SECONDS} second ke liye open rehta hai, phir agla apne aap aa jata hai."
+        "⚡ Jaise hi tum answer doge, agla sawaal turant aa jayega — koi wait nahi."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -203,9 +205,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if context.user_data.get("quiz_items"):
-        cancel_advance_job(context, chat_id)
+        await try_stop_open_poll(chat_id, context)
         score = context.user_data.get("score", 0)
-        context.user_data.clear()
+        reset_quiz_state(context)
         await update.message.reply_text(f"🛑 Quiz cancel kar di gayi.\nScore: {score}")
     else:
         await update.message.reply_text("Koi active quiz nahi chal rahi.")
@@ -246,7 +248,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Quiz flow (native Telegram Quiz Polls)
+# Quiz flow (native Telegram Quiz Polls, instant advance on answer)
 # ---------------------------------------------------------------------------
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -290,17 +292,17 @@ async def start_quiz(chat_id, context, filename, stop_query=None):
         await context.bot.send_message(chat_id=chat_id, text=f"❌ Saved quiz corrupt hai: {error}")
         return
 
-    cancel_advance_job(context, chat_id)
+    await try_stop_open_poll(chat_id, context)
+    reset_quiz_state(context)
     context.user_data["quiz_file"] = filename
     context.user_data["quiz_items"] = data
     context.user_data["q_index"] = 0
     context.user_data["score"] = 0
     context.user_data["total"] = len(data)
-    context.user_data["poll_id"] = None
 
     stop_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 STOP", callback_data="stop")]])
     stop_text = (
-        f"🎯 Quiz shuru! {len(data)} sawaal aayenge, har ek {QUESTION_SECONDS} second ke liye khula rahega.\n"
+        f"🎯 Quiz shuru! {len(data)} sawaal aayenge, ek ke baad ek turant.\n"
         "Kabhi bhi rokne ke liye neeche 🛑 STOP dabao."
     )
     if stop_query:
@@ -336,32 +338,11 @@ async def send_question(chat_id, context: ContextTypes.DEFAULT_TYPE):
         correct_option_id=correct_index,
         is_anonymous=False,
         explanation=explanation,
-        open_period=QUESTION_SECONDS,
     )
 
     context.user_data["poll_id"] = msg.poll.id
+    context.user_data["poll_message_id"] = msg.message_id
     context.user_data["correct_index"] = correct_index
-
-    if context.job_queue is None:
-        logger.warning("JobQueue not available — auto-advance won't work. Install python-telegram-bot[job-queue].")
-        return
-
-    context.job_queue.run_once(
-        advance_after_timer,
-        when=QUESTION_SECONDS,
-        data={"poll_id": msg.poll.id},
-        name=job_name_for(chat_id),
-        chat_id=chat_id,
-        user_id=chat_id,
-    )
-
-
-async def advance_after_timer(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    if context.user_data.get("poll_id") != job.data.get("poll_id"):
-        return  # user already stopped or moved on
-    context.user_data["q_index"] = context.user_data.get("q_index", 0) + 1
-    await send_question(job.chat_id, context)
 
 
 async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -370,10 +351,18 @@ async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     if not answer.option_ids:
         return  # vote retracted
+
+    chat_id = answer.user.id  # private 1-to-1 chat with the bot
+
     chosen = answer.option_ids[0]
     correct = context.user_data.get("correct_index")
     if chosen == correct:
         context.user_data["score"] = context.user_data.get("score", 0) + 1
+
+    await try_stop_open_poll(chat_id, context)
+
+    context.user_data["q_index"] = context.user_data.get("q_index", 0) + 1
+    await send_question(chat_id, context)
 
 
 async def finish_quiz(chat_id, context: ContextTypes.DEFAULT_TYPE):
@@ -390,16 +379,18 @@ async def finish_quiz(chat_id, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔁 PLAY AGAIN", callback_data="playagain")],
     ])
-    context.user_data["poll_id"] = None
+    quiz_file = context.user_data.get("quiz_file")
+    reset_quiz_state(context)
+    context.user_data["quiz_file"] = quiz_file  # keep for PLAY AGAIN
     await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
 
 
 async def stop_quiz(query, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
-    cancel_advance_job(context, chat_id)
+    await try_stop_open_poll(chat_id, context)
     score = context.user_data.get("score", 0)
     answered_upto = context.user_data.get("q_index", 0)
-    context.user_data.clear()
+    reset_quiz_state(context)
 
     text = (
         f"🛑 Quiz roki gayi.\n"
@@ -449,13 +440,6 @@ def main():
     threading.Thread(target=start_health_server, daemon=True).start()
 
     application = Application.builder().token(BOT_TOKEN).build()
-
-    if application.job_queue is None:
-        raise RuntimeError(
-            "JobQueue install nahi hai. requirements.txt me "
-            "'python-telegram-bot[job-queue]>=22.0,<23.0' hona chahiye, "
-            "phir 'pip install -r requirements.txt' dobara chalao."
-        )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
