@@ -2,6 +2,8 @@ import os
 import json
 import glob
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -346,6 +348,30 @@ async def stop_quiz(query, context):
 
 
 # ---------------------------------------------------------------------------
+# Dummy HTTP server (Render free Web Service needs an open port for its
+# health check; the bot itself only uses Telegram long-polling, not HTTP)
+# ---------------------------------------------------------------------------
+
+class _HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+    def log_message(self, format, *args):
+        # Silence default request logging so it doesn't spam bot logs
+        pass
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), _HealthCheckHandler)
+    logger.info(f"Health check server listening on port {port}")
+    server.serve_forever()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -355,6 +381,10 @@ def main():
             "BOT_TOKEN environment variable set nahi hai. "
             "Isse set karo (export BOT_TOKEN=...) phir bot run karo."
         )
+
+    # Start the dummy HTTP server in a background thread so Render's port
+    # check passes, while the bot itself keeps polling Telegram.
+    threading.Thread(target=start_health_server, daemon=True).start()
 
     application = Application.builder().token(BOT_TOKEN).build()
 
